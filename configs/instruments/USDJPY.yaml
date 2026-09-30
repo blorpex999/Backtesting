@@ -1,0 +1,24 @@
+symbol: USDJPY
+description: Dollar US / Yen
+asset_class: forex
+quote_currency: JPY
+base_currency: USD
+unit_name: pip          # pip (forex) ou point
+pip_size: 0.01
+price_decimals: 3       # précision des prix Dukascopy
+dukascopy:
+  instrument_id: usdjpy
+  name: USD/JPY
+  first_m1: 2003-05-04      # première bougie M1 annoncée par dukascopy-node 1.50.0
+sessions:
+  # HYPOTHÈSE À REMPLACER : horaires provisoires, à vérifier avec les
+  # caractéristiques du symbole dans MT5 (FTMO) et avec la carte de couverture
+  # du contrôle qualité. Heures locales du marché de référence.
+  timezone: America/New_York
+  weekly_open: {day: sun, time: "17:00"}
+  weekly_close: {day: fri, time: "17:00"}
+  daily_breaks: []
+  closed_dates: ["12-25", "01-01"]
+  holiday_calendar: null
+  verified: false
+notes: []

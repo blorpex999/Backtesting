@@ -1,0 +1,23 @@
+download:
+  tool: dukascopy-node
+  version: "1.50.0"          # version épinglée (npm)
+  history_start: 2009-01-01  # début de la chauffe ; l'IS commence en 2010
+  batch_size: 10             # requêtes parallèles par lot
+  batch_pause_ms: 1000       # pause entre lots (politesse envers le serveur)
+  retries: 5                # au moins 1 : avec 0, dukascopy-node masque les erreurs réseau
+  retry_pause_ms: 2000
+  timeout_s: 1800            # par mois et par côté (BID / ASK)
+
+quality:
+  # Fuseau des « jours » du contrôle qualité (et des jours exclus).
+  day_timezone: Europe/Paris
+  gap_warn_minutes: 15          # trou signalé (avertissement)
+  gap_invalid_minutes: 60       # trou qui invalide le jour
+  min_day_coverage: 0.90        # minutes observées / minutes de cotation attendues
+  spread_outlier_factor: 10.0   # spread > facteur × médiane du jour
+  spread_outlier_max_share: 0.02
+  max_negative_spread_minutes: 0
+  max_one_sided_minutes: 5      # minutes avec BID sans ASK (ou l'inverse)
+  max_invalid_ohlc_minutes: 0
+  low_liquidity_days: ["12-24", "12-25", "12-31", "01-01"]
+  exclude_low_liquidity: true

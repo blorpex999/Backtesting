@@ -1,0 +1,26 @@
+symbol: US30
+description: Dow Jones 30 (CFD)
+asset_class: index
+quote_currency: USD
+base_currency: null
+unit_name: point          # pip (forex) ou point
+pip_size: 1.0
+price_decimals: 3       # précision des prix Dukascopy
+dukascopy:
+  instrument_id: usa30idxusd
+  name: USA30.IDX/USD
+  first_m1: 2013-09-30      # première bougie M1 annoncée par dukascopy-node 1.50.0
+sessions:
+  # HYPOTHÈSE À REMPLACER : horaires provisoires, à vérifier avec les
+  # caractéristiques du symbole dans MT5 (FTMO) et avec la carte de couverture
+  # du contrôle qualité. Heures locales du marché de référence.
+  timezone: America/New_York
+  weekly_open: {day: sun, time: "18:00"}
+  weekly_close: {day: fri, time: "17:00"}
+  daily_breaks:
+    - {start: "17:00", end: "18:00"}
+  closed_dates: ["12-25", "01-01"]
+  holiday_calendar: XNYS
+  verified: false
+notes:
+  - "Prix Dukascopy (CFD) : ils peuvent différer de ceux de FTMO (sous-jacent, horaires, spread)."

@@ -1,0 +1,16 @@
+# Périodes de recherche. Dates = minuit UTC ; la fin est EXCLUE.
+# Le chargeur de données n'autorise que l'IS (et la chauffe avant l'IS) :
+# toute plage qui touche l'OOS ou le HOLDOUT est refusée et journalisée.
+default:
+  is:      {start: 2010-01-01, end: 2020-01-01}
+  oos:     {start: 2020-01-01, end: 2024-01-01}
+  holdout: {start: 2024-01-01, end: null}   # null = jusqu'à la fin des données
+
+# Données antérieures à l'IS : utilisables uniquement pour initialiser les
+# indicateurs (jamais pour trader).
+warmup_start: 2009-01-01
+
+# Surcharges par instrument (même structure que « default »). Les instruments à
+# historique court démarrent simplement leur IS au début de leurs données ;
+# les dates OOS / HOLDOUT restent communes à tous.
+overrides: {}

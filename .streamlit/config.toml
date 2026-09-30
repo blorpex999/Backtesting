@@ -1,0 +1,11 @@
+# Interface locale uniquement : écoute sur 127.0.0.1, pas de statistiques d'usage.
+[server]
+address = "127.0.0.1"
+headless = true
+
+[browser]
+gatherUsageStats = false
+serverAddress = "127.0.0.1"
+
+[client]
+toolbarMode = "minimal"   # pas de bouton « Deploy » : outil local uniquement

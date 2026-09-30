@@ -1,0 +1,26 @@
+# Données et rapports : volumineux et régénérables (jamais versionnés)
+/data/
+/reports/
+
+# Outils installés localement (dukascopy-node épinglé)
+/.tools/
+
+# Registre des essais : runs.db EST versionné, pas ses fichiers temporaires SQLite
+registry/*.db-journal
+registry/*.db-wal
+registry/*.db-shm
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Divers
+*.tmp
+.DS_Store
+Thumbs.db
