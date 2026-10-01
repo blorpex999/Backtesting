@@ -48,20 +48,31 @@ Le téléchargement reprend là où il s'est arrêté : relancez simplement la c
 coupure. Seuls les jours UTC complets sont téléchargés ; le mois en cours est retéléchargé à la
 mise à jour suivante.
 
-**Limite de débit Dukascopy (HTTP 429).** L'API de Dukascopy refuse les requêtes trop rapprochées.
-Les réglages par défaut sont donc prudents : une requête à la fois, 1,5 s de pause entre deux
-requêtes, soit environ 0,6 requête/s (`configs/data.yaml`). En cas de refus, l'outil :
+**Refus de Dukascopy (HTTP 429).** L'API de Dukascopy refuse parfois des requêtes, pour deux
+raisons différentes que l'outil distingue :
 
-- attend 60 s, puis 120 s, 240 s… (15 min au plus) ;
-- réduit le débit ;
-- réessaie le même mois.
+- **un jour précis est refusé**, quel que soit le débit (constaté sur des mois de 2009) ;
+- **le débit est trop élevé** (limite de requêtes).
 
-Si le refus persiste après 6 pauses, il s'arrête proprement, et les instruments suivants ne
-sont pas traités : relancez plus tard, la reprise est automatique. Les jours déjà récupérés d'un
-mois interrompu sont gardés en cache et ne sont pas redemandés. L'historique complet représente
-environ 13 000 requêtes par instrument (une par jour et par côté) : la première récupération
-prend environ 6 heures par instrument à ce débit (à lancer la nuit, par exemple), les mises à jour suivantes
-sont rapides.
+Fonctionnement :
+
+1. Chaque mois est d'abord demandé d'un bloc, une requête à la fois, avec 1,5 s de pause
+   (environ 0,6 requête/s, `configs/data.yaml`).
+2. Si le mois échoue, il est repris **jour par jour**. Les jours déjà obtenus sont relus dans
+   le cache, sans nouvelle requête.
+3. Chaque refus est vérifié par une **requête témoin** sur un jour déjà servi :
+   - si le témoin passe, seul ce jour est refusé : il est noté, et le reste du mois continue.
+     Il est redemandé aux lancements suivants. Après 3 lancements, il est déclaré
+     **indisponible chez la source** et exclu par le contrôle qualité, avec cette raison ;
+   - si le témoin est refusé aussi, c'est la limite de débit : pause de 60 s, puis 120 s,
+     240 s… (15 min au plus), débit réduit, nouvel essai. Après 6 pauses, l'outil s'arrête
+     proprement et ne traite pas les instruments suivants : relancez plus tard, la reprise
+     est automatique.
+
+La fin de la commande résume les jours refusés (à réessayer) et les jours déclarés
+indisponibles. L'historique complet représente environ 13 000 requêtes par instrument (une par
+jour et par côté) : la première récupération prend environ 6 heures par instrument à ce débit (à
+lancer la nuit, par exemple), les mises à jour suivantes sont rapides.
 
 Dans le code, les prix se lisent **uniquement** via le chargeur :
 

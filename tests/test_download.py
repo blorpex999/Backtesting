@@ -169,54 +169,86 @@ def test_first_month_starting_mid_month_is_complete(ctx):
     assert "2019-11" in [c.key for c in dl2.plan(ctx.instrument("EURUSD"))]
 
 
-def test_failed_chunk_is_retried_on_next_run(ctx, eurusd_frame):
+def test_month_with_a_refused_day_falls_back_to_days(ctx, eurusd_frame):
+    """A day refused alone (control request passes) does not block its month."""
     inst = ctx.instrument("EURUSD")
     source = FakeSource({"eurusd": eurusd_frame})
-    source.fail_on = {("2019-12", "ask")}
-    dl = _downloader(ctx, source, now="2020-01-15")
+    source.refused_days = {"2019-12-10"}
+    sleeps: list[float] = []
+    dl = _downloader(ctx, source, now="2020-01-15", sleeps=sleeps)
     report = dl.download(inst, log=lambda _: None)
-    assert not report.ok and report.failed[0][:2] == ("2019-12", "ask")
-    assert "2019-12" not in json.loads(dl.manifest_path("EURUSD").read_text())["chunks"]
-    assert any("mois non téléchargés 2019-12" in w for w in report.warnings)
+    assert report.ok and sleeps == [], "no rate-limit pause for a single refused day"
+    assert report.retry_days == ["2019-12-10 BID", "2019-12-10 ASK"]
+    entry = json.loads(dl.manifest_path("EURUSD").read_text())["chunks"]["2019-12"]
+    assert entry["complete"] is False and entry["bid"]["mode"] == "day"
+    assert entry["bid"]["failed_days"]["2019-12-10"]["attempts"] == 1
+    stored = ctx.store.read_years("EURUSD", [2019])
+    days = set(stored["ts_utc"].dt.strftime("%Y-%m-%d"))
+    assert "2019-12-09" in days and "2019-12-11" in days and "2019-12-10" not in days
+    # the days fetched by the failed month attempt are reused through the month cache
+    month_cache = dl.cache_dir("EURUSD", "bid", Chunk(2019, 12))
+    assert month_cache in source.cache_dirs
 
-    source.fail_on = set()
+    # Next runs: only the refused day is requested again (+ one control request per side).
     source.calls.clear()
-    report = dl.download(inst, log=lambda _: None)
-    assert report.ok and "2019-12" in report.planned and "2019-11" not in report.planned
+    source.cache_dirs.clear()
+    dl.download(inst, end=_utc("2020-01-01"), log=lambda _: None)
+    downloads = [c for c, cache in zip(source.calls, source.cache_dirs, strict=True) if cache]
+    controls = [c for c, cache in zip(source.calls, source.cache_dirs, strict=True) if not cache]
+    assert {(c[1], c[2]) for c in downloads} == {
+        ("bid", _utc("2019-12-10")),
+        ("ask", _utc("2019-12-10")),
+    }
+    assert len(downloads) == 2 and len(controls) == 2
+    assert all(c[2] != _utc("2019-12-10") for c in controls), "control = a day already served"
+    report = dl.download(inst, end=_utc("2020-01-01"), log=lambda _: None)
+    assert report.unavailable_days == ["2019-12-10 BID", "2019-12-10 ASK"]
+    entry = json.loads(dl.manifest_path("EURUSD").read_text())["chunks"]["2019-12"]
+    assert entry["complete"] is True and "2019-12-10" in entry["bid"]["unavailable_days"]
+    assert not dl.day_dir("EURUSD", "bid", Chunk(2019, 12)).exists(), "cleaned once complete"
+    assert dl.plan(inst, end=_utc("2020-01-01")) == []
+
+    # The quality control excludes that day and says why.
+    from btlab.data.quality import run_quality
+
+    qc = run_quality(inst, ctx.store, ctx.settings.quality, data_end=_utc("2020-01-01"))
+    day = qc.days[qc.days["day"].astype(str) == "2019-12-10"].iloc[0]
+    assert day["status"] == "invalid" and "refusées par la source" in day["reasons"]
+    assert "source_unavailable" in set(qc.anomalies["kind"])
 
 
-def test_rate_limit_waits_slows_down_and_retries_same_month(ctx, eurusd_frame):
+def test_rate_limit_is_told_apart_by_the_control_request(ctx, eurusd_frame):
+    """Control request refused too: the server limits the rate -> pause, slow down, retry."""
     source = FakeSource({"eurusd": eurusd_frame})
-    source.rate_limit = {("2019-12", "bid"): 2}
+    source.ip_block = 3  # month request, first day, control request
     sleeps: list[float] = []
     dl = _downloader(ctx, source, now="2020-01-15", sleeps=sleeps)
     report = dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
-    assert report.ok and report.rate_limited
-    assert sleeps == [60, 120]  # doubling waits
-    assert source.slow_downs == 2
+    assert sleeps == [60] and source.slow_downs == 1
+    assert report.ok and report.rate_limited and report.retry_days == []
     assert report.done == ["2019-11", "2019-12", "2020-01"]
 
 
 def test_persistent_rate_limit_stops_the_run_then_resumes(ctx, eurusd_frame):
     source = FakeSource({"eurusd": eurusd_frame})
-    source.rate_limit = {("2019-12", "bid"): 99}
+    source.ip_block = 999
     sleeps: list[float] = []
     dl = _downloader(ctx, source, now="2020-02-15", sleeps=sleeps, rate_limit_max_waits=2)
     logs: list[str] = []
     report = dl.download(ctx.instrument("EURUSD"), log=logs.append)
     assert sleeps == [60, 120]
     assert report.aborted and "HTTP 429" in report.aborted and not report.ok
-    assert report.done == ["2019-11"]
-    assert not any(c[2] >= _utc("2020-01-01") for c in source.calls), "stopped, no hammering"
+    downloads = [c for c, cache in zip(source.calls, source.cache_dirs, strict=True) if cache]
+    assert not any(c[2] >= _utc("2019-12-01") for c in downloads), "stopped, no hammering"
     assert any("la reprise est automatique" in line for line in logs)
-    source.rate_limit = {}
+    source.ip_block = 0
     report = dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
-    assert report.ok and report.planned == ["2019-12", "2020-01", "2020-02"]
+    assert report.ok and report.planned == ["2019-11", "2019-12", "2020-01", "2020-02"]
 
 
 def test_wait_is_capped(ctx, eurusd_frame):
     source = FakeSource({"eurusd": eurusd_frame})
-    source.rate_limit = {("2019-11", "bid"): 3}
+    source.ip_block = 7  # month, then (day + control) three times
     sleeps: list[float] = []
     dl = _downloader(
         ctx,
@@ -230,13 +262,25 @@ def test_wait_is_capped(ctx, eurusd_frame):
     assert sleeps == [400, 800, 900]
 
 
-def test_consecutive_failures_stop_the_run(ctx, eurusd_frame):
+def test_consecutive_failures_stop_the_run_then_resume(ctx, eurusd_frame):
     source = FakeSource({"eurusd": eurusd_frame})
-    source.fail_on = {("2019-11", "bid"), ("2019-12", "bid"), ("2020-01", "bid")}
-    dl = _downloader(ctx, source, now="2020-02-15", max_consecutive_failures=3)
+    source.fail_on = {("2019-12", "ask")}
+    dl = _downloader(ctx, source, now="2020-01-15", max_consecutive_failures=5)
     report = dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
-    assert report.aborted == "3 mois de suite en échec"
-    assert not any(c[2] >= _utc("2020-02-01") for c in source.calls)
+    assert report.aborted.startswith("5 requêtes de suite en échec")
+    assert "échec simulé" in report.aborted
+    assert not any(c[2] >= _utc("2020-01-01") for c in source.calls)
+    entry = json.loads(dl.manifest_path("EURUSD").read_text())["chunks"]["2019-12"]
+    assert entry["bid"]["complete"] is True and entry["complete"] is False
+
+    source.fail_on = set()
+    source.calls.clear()
+    report = dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
+    assert report.ok and report.planned == ["2019-12", "2020-01"]
+    assert not any(c[1] == "bid" and c[2] < _utc("2020-01-01") for c in source.calls), (
+        "the BID side of December was already complete"
+    )
+    assert json.loads(dl.manifest_path("EURUSD").read_text())["chunks"]["2019-12"]["complete"]
 
 
 def test_empty_month_while_quotes_expected_is_flagged(ctx, eurusd_frame):
@@ -317,19 +361,25 @@ def test_node_source_failure_raises(fake_node_source, tmp_path, monkeypatch):
 
 def test_node_source_rate_limit_slow_down_and_cache(fake_node_source, tmp_path, monkeypatch):
     dest = tmp_path / "raw" / "EURUSD" / "bid" / "2020-01.csv"
-    cache = dest.parent / ".cache" / "2020-01"
+    cache = tmp_path / "raw" / "EURUSD" / "bid" / ".cache" / "2020-01"
     monkeypatch.setenv("FAKE_FAIL", "429")
     with pytest.raises(RateLimitError, match="HTTP 429"):
-        fake_node_source.fetch("eurusd", "bid", _utc("2020-01-01"), _utc("2020-02-01"), dest)
+        fake_node_source.fetch(
+            "eurusd", "bid", _utc("2020-01-01"), _utc("2020-02-01"), dest, cache_dir=cache
+        )
     assert cache.is_dir(), "cache kept after a failure: fetched days are not requested again"
 
     assert fake_node_source.slow_down().startswith("1 requête(s) à la fois")
     monkeypatch.delenv("FAKE_FAIL")
-    fake_node_source.fetch("eurusd", "bid", _utc("2020-01-01"), _utc("2020-02-01"), dest)
+    fake_node_source.fetch(
+        "eurusd", "bid", _utc("2020-01-01"), _utc("2020-02-01"), dest, cache_dir=cache
+    )
     args = json.loads(next((dest.parent / ".tmp").glob("*.args.json")).read_text())
     assert args[args.index("-bs") + 1] == "1" and args[args.index("-bp") + 1] == "3000"
     assert args[args.index("-chpath") + 1] == str(cache)
-    assert not cache.exists(), "cache removed once the month succeeded"
+    fake_node_source.fetch("eurusd", "bid", _utc("2020-01-01"), _utc("2020-01-02"), dest)
+    args = json.loads(next((dest.parent / ".tmp").glob("*.args.json")).read_text())
+    assert "-ch" not in args, "no cache unless asked (control requests)"
 
 
 def test_node_source_pauses_between_runs(fake_node_source, tmp_path):

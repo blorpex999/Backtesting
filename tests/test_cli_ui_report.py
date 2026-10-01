@@ -147,7 +147,7 @@ def test_cli_rate_limit_stops_remaining_symbols(project, fake_source, ctx, monke
     fake_source.frames["eurusd"] = synthetic_m1(
         ctx.instrument("EURUSD"), "2019-12-01", "2020-01-10"
     )
-    fake_source.rate_limit = {("2019-12", "bid"): 99}
+    fake_source.ip_block = 999
     args = ["data", "download", "GBPUSD", "EURUSD", "--from", "2019-12-01", "--to", "2020-01-10"]
     result = runner.invoke(app, args)
     assert result.exit_code == 1

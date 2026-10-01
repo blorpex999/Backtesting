@@ -51,6 +51,8 @@ ANOMALY_LABELS = {
     "exact_duplicate": "doublon identique (retiré à la construction)",
     "conflicting_duplicate": "doublon contradictoire (retiré à la construction)",
     "outside_requested_range": "lignes hors plage demandée (ignorées)",
+    "source_missing": "jour refusé par la source (nouvel essai au prochain téléchargement)",
+    "source_unavailable": "jour indisponible chez la source (abandonné)",
 }
 WEEKDAY_LABELS = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
 
@@ -73,6 +75,7 @@ DAY_COLUMNS = [
     "median_spread",
     "exact_duplicates",
     "conflicting_duplicates",
+    "source_refused",
     "holiday",
     "low_liquidity",
 ]
@@ -262,6 +265,9 @@ def _analyse_window(
             "conflicting_duplicates": _count_by_day(
                 issue_kind == "conflicting_duplicate", issue_day
             ),
+            "source_refused": _count_by_day(
+                np.isin(issue_kind, ["source_missing", "source_unavailable"]), issue_day
+            ),
             "median_spread": day_median / inst.pip_size
             if len(day_median)
             else pd.Series(dtype=float),
@@ -296,6 +302,7 @@ def _classify(
         "gaps_warn",
         "exact_duplicates",
         "conflicting_duplicates",
+        "source_refused",
     ]
     frame[int_cols] = frame[int_cols].astype("int64")
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -338,6 +345,8 @@ def _classify(
             reasons.append(f"{row.one_sided} minute(s) avec un seul côté (BID/ASK)")
         if row.conflicting_duplicates > 0:
             reasons.append(f"{row.conflicting_duplicates} doublon(s) contradictoire(s)")
+        if row.source_refused > 0:
+            reasons.append("données refusées par la source (Dukascopy) pour ce jour")
         both_total = row.observed + row.observed_outside
         if both_total and row.spread_outliers / both_total > qs.spread_outlier_max_share:
             reasons.append(

@@ -10,12 +10,17 @@ download:
                              # pas plus : pendant un blocage, insister le prolonge
   retry_pause_ms: 10000      # pause avant la reprise d'une requête
   timeout_s: 3600            # par mois et par côté (BID / ASK)
-  # En cas de HTTP 429 : pause (60 s, puis doublée à chaque fois, 900 s au plus),
-  # débit réduit, et nouvel essai du même mois ; arrêt propre après 6 pauses.
+  # Un mois refusé est repris jour par jour. Chaque refus (HTTP 429) est qualifié par
+  # une requête témoin sur un jour déjà servi :
+  # - le témoin passe : seul ce jour est refusé ; nouvel essai aux lancements suivants,
+  #   puis « indisponible chez la source » (exclu par le contrôle qualité) ;
+  # - le témoin est refusé aussi : limite de débit ; pause (60 s, doublée à chaque fois,
+  #   900 s au plus), débit réduit, nouvel essai ; arrêt propre après 6 pauses.
   rate_limit_wait_s: 60
   rate_limit_max_wait_s: 900
   rate_limit_max_waits: 6
-  max_consecutive_failures: 3  # arrêt après N mois de suite en échec (autre cause)
+  max_day_attempts: 3          # lancements avant de déclarer un jour indisponible
+  max_consecutive_failures: 10 # arrêt après N requêtes de suite en échec (autre cause)
 
 quality:
   # Fuseau des « jours » du contrôle qualité (et des jours exclus).

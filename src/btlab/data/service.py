@@ -73,9 +73,10 @@ def download(
 ) -> DownloadReport:
     inst = ctx.instrument(symbol)
     report = make_downloader(ctx, source).download(inst, start, end, force=force, log=log)
+    has_data = ctx.store.span(symbol)[2] > 0
     if (
         qc
-        and ctx.store.years(symbol)
+        and has_data
         and (report.years_built or quality_state(ctx.paths.quality, ctx.store, symbol) != "ok")
     ):
         run_qc(ctx, symbol, log=log)

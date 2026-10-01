@@ -12,6 +12,13 @@ Layout:
 Only complete UTC days are downloaded (up to today 00:00 UTC). The current month
 is marked partial and fetched again on the next update. Minutes without quotes
 stay absent (no flat filler candles), so that gaps remain visible to the QC.
+
+Resilience: a month is first fetched in one go. If that fails, it is fetched day by
+day (reusing the month cache), so that one day refused by the server does not block
+the whole month. Each refusal is qualified with a control request on a day known to
+be served: if the control passes, only that day is refused (noted, retried at the
+next run, declared unavailable after ``max_day_attempts`` runs); if the control is
+refused too, the server is limiting the rate (pause, slow down, retry).
 """
 
 from __future__ import annotations
@@ -96,15 +103,21 @@ def month_chunks(start: pd.Timestamp, end: pd.Timestamp) -> list[Chunk]:
 
 
 # --- CSV parsing -------------------------------------------------------------------
+def empty_candles() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ts_utc": pd.Series(dtype="datetime64[ns, UTC]"),
+            **{c: pd.Series(dtype="float64") for c in _SIDE_COLS},
+        }
+    )
+
+
 def parse_candles_csv(
     path: Path, start: pd.Timestamp | None = None, end: pd.Timestamp | None = None
 ) -> tuple[pd.DataFrame, int]:
     """Read a dukascopy-node M1 CSV. Returns (frame, rows outside ``[start, end)``)."""
-    cols = ["ts_utc", *_SIDE_COLS]
-    if not path.exists() or path.stat().st_size == 0:
-        return pd.DataFrame({c: pd.Series(dtype="float64") for c in cols}).astype(
-            {"ts_utc": "datetime64[ns, UTC]"}
-        ), 0
+    if not path.is_file() or path.stat().st_size == 0:
+        return empty_candles(), 0
     df = pd.read_csv(path, dtype={"timestamp": "int64"})
     if list(df.columns) != CSV_HEADER:
         raise DownloadError(
@@ -127,6 +140,26 @@ def parse_candles_csv(
     if end is not None:
         keep &= out["ts_utc"] < end
     return out[keep].reset_index(drop=True), int((~keep).sum())
+
+
+def write_candles_csv(frame: pd.DataFrame, path: Path) -> None:
+    """Write candles (``ts_utc, o, h, l, c, v``) in the dukascopy-node CSV layout."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    if frame.empty:
+        tmp.write_text("", encoding="utf-8")
+    else:
+        pd.DataFrame(
+            {
+                "timestamp": pd.DatetimeIndex(frame["ts_utc"]).as_unit("ms").asi8,
+                "open": frame["o"],
+                "high": frame["h"],
+                "low": frame["l"],
+                "close": frame["c"],
+                "volume": frame["v"],
+            }
+        ).to_csv(tmp, index=False)
+    os.replace(tmp, path)
 
 
 # --- merging BID / ASK -------------------------------------------------------------
@@ -185,7 +218,13 @@ class M1Source(Protocol):
     version: str
 
     def fetch(
-        self, instrument_id: str, side: str, start: pd.Timestamp, end: pd.Timestamp, dest: Path
+        self,
+        instrument_id: str,
+        side: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        dest: Path,
+        cache_dir: Path | None = None,
     ) -> None:
         """Write the M1 candles of ``[start, end)`` for one side as CSV at ``dest``."""
 
@@ -301,9 +340,10 @@ class DukascopyNodeSource:
         end: pd.Timestamp,
         out_dir: Path,
         stem: str,
-        cache_dir: Path,
+        cache_dir: Path | None = None,
     ) -> list[str]:
         s = self.settings
+        cache = ["-ch", "-chpath", str(cache_dir)] if cache_dir is not None else []
         return [
             self.node_executable(),
             str(self.cli_js),
@@ -334,16 +374,20 @@ class DukascopyNodeSource:
             str(s.retries),
             "-rp",
             str(s.retry_pause_ms),
-            # Per-month cache: after a failure, the days already fetched are not requested
-            # again. Deleted once the month succeeds.
-            "-ch",
-            "-chpath",
-            str(cache_dir),
+            # Optional per-month cache: after a failure, the days already fetched are not
+            # requested again (the downloader deletes it once the month is complete).
+            *cache,
             "-s",
         ]
 
     def fetch(
-        self, instrument_id: str, side: str, start: pd.Timestamp, end: pd.Timestamp, dest: Path
+        self,
+        instrument_id: str,
+        side: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        dest: Path,
+        cache_dir: Path | None = None,
     ) -> None:
         if start != start.normalize() or end != end.normalize():
             raise ValueError("dukascopy-node : les bornes doivent être des minuits UTC")
@@ -353,7 +397,6 @@ class DukascopyNodeSource:
         stem = f"{dest.stem}-{os.getpid()}"
         tmp_file = tmp_dir / f"{stem}.csv"
         tmp_file.unlink(missing_ok=True)
-        cache_dir = dest.parent / ".cache" / dest.stem
         cmd = self.command(instrument_id, side, start, end, tmp_dir, stem, cache_dir)
         try:
             proc = subprocess.run(
@@ -381,7 +424,6 @@ class DukascopyNodeSource:
             )
         dest.parent.mkdir(parents=True, exist_ok=True)
         os.replace(tmp_file, dest)
-        shutil.rmtree(cache_dir, ignore_errors=True)
         # Keep the same spacing between two runs of the CLI as between two batches.
         self.sleep(self.batch_pause_ms / 1000)
 
@@ -450,10 +492,32 @@ class DownloadReport:
     warnings: list[str] = field(default_factory=list)
     aborted: str | None = None  # why the run stopped before the end, if it did
     rate_limited: bool = False
+    retry_days: list[str] = field(default_factory=list)  # refused, retried next run
+    unavailable_days: list[str] = field(default_factory=list)  # given up this run
 
     @property
     def ok(self) -> bool:
         return not self.failed and self.aborted is None
+
+
+class _StopRun(DownloadError):
+    """Stop the whole run (persistent rate limit, or too many failures in a row)."""
+
+    def __init__(self, message: str, partial: dict | None = None):
+        super().__init__(message)
+        self.partial = partial
+
+
+@dataclass
+class _RunState:
+    probe: tuple[pd.Timestamp, str]  # a (day, side) known to be served: control request
+    error_streak: int = 0  # consecutive failed requests other than HTTP 429
+
+
+def _first_wednesday(start: pd.Timestamp, end: pd.Timestamp) -> pd.Timestamp | None:
+    days = pd.date_range(start, end, freq="D", inclusive="left")
+    weds = days[days.dayofweek == 2]
+    return weds[0] if len(weds) else None
 
 
 class Downloader:
@@ -473,15 +537,23 @@ class Downloader:
         self.now = now
         self.sleep = sleep or time.sleep
 
+    # --- locations -------------------------------------------------------------
     def manifest_path(self, symbol: str) -> Path:
         return self.raw_root / symbol / "manifest.json"
 
     def raw_path(self, symbol: str, side: str, chunk: Chunk) -> Path:
         return self.raw_root / symbol / side / f"{chunk.key}.csv"
 
+    def cache_dir(self, symbol: str, side: str, chunk: Chunk) -> Path:
+        return self.raw_root / symbol / side / ".cache" / chunk.key
+
+    def day_dir(self, symbol: str, side: str, chunk: Chunk) -> Path:
+        return self.raw_root / symbol / side / f"{chunk.key}.days"
+
     def load_manifest(self, inst: Instrument) -> Manifest:
         return Manifest.load(self.manifest_path(inst.symbol), inst, self.source)
 
+    # --- planning ---------------------------------------------------------------
     def cutoff(self) -> pd.Timestamp:
         """End of the last complete UTC day."""
         return utc_midnight(self.now())
@@ -515,6 +587,20 @@ class Downloader:
             )
         ]
 
+    def _initial_probe(self, manifest: Manifest) -> tuple[pd.Timestamp, str]:
+        """A day the server is known (or very likely) to serve, for control requests."""
+        for key in sorted(manifest.chunks, reverse=True):
+            entry = manifest.chunks[key]
+            if entry.get("complete"):
+                day = _first_wednesday(pd.Timestamp(entry["start"]), pd.Timestamp(entry["end"]))
+                if day is not None:
+                    return day, "bid"
+        day = self.cutoff() - pd.Timedelta(days=2)
+        while day.dayofweek != 2:
+            day -= pd.Timedelta(days=1)
+        return day, "bid"
+
+    # --- download ---------------------------------------------------------------
     def download(
         self,
         inst: Instrument,
@@ -540,106 +626,243 @@ class Downloader:
             f"{inst.symbol} : {len(chunks)} mois à télécharger ({span}), environ "
             f"{2 * days} requêtes (une par jour et par côté)."
         )
+        state = _RunState(probe=self._initial_probe(manifest))
         touched_years: set[int] = set()
-        consecutive_failures = 0
         for chunk in chunks:
             c_start, c_end = max(chunk.start, lo), min(chunk.end, hi)
-            entry = {"start": c_start.isoformat(), "end": c_end.isoformat()}
-            ok = True
+            previous = manifest.chunks.get(chunk.key, {})
+            if force or previous.get("start") != c_start.isoformat():
+                previous = {}
+                for side in SIDES:
+                    shutil.rmtree(self.day_dir(inst.symbol, side, chunk), ignore_errors=True)
+                    shutil.rmtree(self.cache_dir(inst.symbol, side, chunk), ignore_errors=True)
+            entry: dict = {"start": c_start.isoformat(), "end": c_end.isoformat()}
+            stop: _StopRun | None = None
             for side in SIDES:
-                dest = self.raw_path(inst.symbol, side, chunk)
+                prev_side = dict(previous.get(side, {}))
+                if previous.get("end") != c_end.isoformat():
+                    # The range grew (current month): a month-mode side is fetched again;
+                    # a day-mode side keeps its days and fetches only the new ones.
+                    if prev_side.get("mode") == "day":
+                        prev_side["complete"] = False
+                    else:
+                        prev_side = {}
                 try:
-                    self._fetch_with_backoff(inst, side, chunk, c_start, c_end, dest, log, report)
-                except RateLimitError as err:
-                    ok = False
-                    report.failed.append((chunk.key, side, str(err)))
-                    report.aborted = (
-                        f"Dukascopy limite toujours le débit (HTTP 429) après "
-                        f"{self.settings.rate_limit_max_waits} pauses"
+                    entry[side] = self._download_side(
+                        inst,
+                        chunk,
+                        side,
+                        c_start,
+                        c_end,
+                        prev_side,
+                        state,
+                        log,
+                        report,
                     )
-                    log(f"  ✗ {chunk.key} {side.upper()} : {err}")
+                except _StopRun as err:
+                    stop = err
+                    if err.partial is not None:
+                        entry[side] = err.partial
                     break
-                except DownloadError as err:
-                    ok = False
-                    report.failed.append((chunk.key, side, str(err)))
-                    log(f"  ✗ {chunk.key} {side.upper()} : {err}")
-                    break
-                frame, _ = parse_candles_csv(dest, c_start, c_end)
-                entry[side] = {"rows": len(frame)}
-            if not ok:
-                consecutive_failures += 1
-                if (
-                    report.aborted is None
-                    and consecutive_failures >= self.settings.max_consecutive_failures
-                ):
-                    report.aborted = f"{consecutive_failures} mois de suite en échec"
-                if report.aborted:
-                    log(
-                        f"  ■ Téléchargement de {inst.symbol} interrompu : {report.aborted}. "
-                        "Relancez plus tard : la reprise est automatique."
-                    )
-                    break
-                continue
-            consecutive_failures = 0
-            if min(entry["bid"]["rows"], entry["ask"]["rows"]) == 0 and len(
-                expected_minutes(inst.sessions, c_start, c_end)
-            ):
-                msg = (
-                    f"{inst.symbol} {chunk.key} : aucune bougie reçue (BID ou ASK) alors que "
-                    "des cotations sont attendues"
-                )
-                report.warnings.append(msg)
-                log(f"  ! {msg}")
-            # Complete = the whole month is covered, from its start (or the start of the
-            # instrument's history) to its end, and that end is in the past.
+            covered = c_end == chunk.end <= cutoff and c_start == max(chunk.start, history_floor)
             entry["complete"] = bool(
-                c_end == chunk.end <= cutoff and c_start == max(chunk.start, history_floor)
+                stop is None and covered and all(entry[s].get("complete") for s in SIDES)
             )
             entry["downloaded_at"] = datetime.now(UTC).isoformat(timespec="seconds")
-            manifest.chunks[chunk.key] = entry
-            manifest.save(self.manifest_path(inst.symbol))
+            if any(side in entry for side in SIDES):
+                manifest.chunks[chunk.key] = entry
+                manifest.save(self.manifest_path(inst.symbol))
+                touched_years.add(chunk.year)
+            if stop is not None:
+                report.aborted = str(stop)
+                report.failed.append((chunk.key, "", str(stop)))
+                log(
+                    f"  ■ Téléchargement de {inst.symbol} interrompu : {stop}. "
+                    "Relancez plus tard : la reprise est automatique."
+                )
+                break
+            self._check_month(inst, chunk, entry, c_start, c_end, log, report)
             report.done.append(chunk.key)
-            touched_years.add(chunk.year)
-            log(
-                f"  ✓ {chunk.key} : {entry['bid']['rows']} bougies BID, "
-                f"{entry['ask']['rows']} bougies ASK"
-            )
         if touched_years:
             report.years_built = self.build(inst, sorted(touched_years), log=log, report=report)
         return report
 
-    def _fetch_with_backoff(
-        self,
-        inst: Instrument,
-        side: str,
-        chunk: Chunk,
-        start: pd.Timestamp,
-        end: pd.Timestamp,
-        dest: Path,
-        log: Log,
-        report: DownloadReport,
-    ) -> None:
-        """Fetch one month and side; on HTTP 429, wait (doubling), slow down and retry."""
+    def _check_month(self, inst, chunk, entry, c_start, c_end, log, report) -> None:
+        rows = {s: entry[s]["rows"] for s in SIDES}
+        pending = sum(len(entry[s].get("failed_days", {})) for s in SIDES)
+        status = f" ; {pending} jour(s) en attente" if pending else ""
+        log(f"  ✓ {chunk.key} : {rows['bid']} bougies BID, {rows['ask']} bougies ASK{status}")
+        if min(rows.values()) == 0 and len(expected_minutes(inst.sessions, c_start, c_end)):
+            msg = (
+                f"{inst.symbol} {chunk.key} : aucune bougie reçue (BID ou ASK) alors que "
+                "des cotations sont attendues"
+            )
+            report.warnings.append(msg)
+            log(f"  ! {msg}")
+
+    def _download_side(
+        self, inst, chunk, side, start, end, previous: dict, state: _RunState, log, report
+    ) -> dict:
+        """One month and one side: in one go, or day by day if that fails."""
+        dest = self.raw_path(inst.symbol, side, chunk)
+        cache = self.cache_dir(inst.symbol, side, chunk)
+        if previous.get("complete") and dest.exists():
+            return previous
+        if previous.get("mode") != "day":
+            try:
+                self.source.fetch(
+                    inst.dukascopy.instrument_id, side, start, end, dest, cache_dir=cache
+                )
+            except DownloadError as err:
+                report.rate_limited |= isinstance(err, RateLimitError)
+                reason = "HTTP 429" if isinstance(err, RateLimitError) else "erreur"
+                log(f"  … {chunk.key} {side.upper()} : mois refusé ({reason}), reprise par jour.")
+            else:
+                shutil.rmtree(cache, ignore_errors=True)
+                state.error_streak = 0
+                wednesday = _first_wednesday(start, end)
+                if wednesday is not None:
+                    state.probe = (wednesday, side)
+                return {
+                    "rows": len(parse_candles_csv(dest, start, end)[0]),
+                    "mode": "month",
+                    "complete": True,
+                }
+        return self._download_days(inst, chunk, side, start, end, previous, state, log, report)
+
+    def _download_days(
+        self, inst, chunk, side, start, end, previous: dict, state: _RunState, log, report
+    ) -> dict:
+        s = self.settings
+        day_dir = self.day_dir(inst.symbol, side, chunk)
+        cache = self.cache_dir(inst.symbol, side, chunk)
+        day_dir.mkdir(parents=True, exist_ok=True)
+        failed: dict = dict(previous.get("failed_days", {}))
+        unavailable: dict = dict(previous.get("unavailable_days", {}))
+        refused_now: dict[str, str] = {}
+        days = pd.date_range(start, end, freq="D", inclusive="left")
+        stop: _StopRun | None = None
+        try:
+            for day in days:
+                key = f"{day:%Y-%m-%d}"
+                if (day_dir / f"{key}.csv").exists() or key in unavailable:
+                    continue
+                error = self._fetch_day(
+                    inst, side, day, day_dir / f"{key}.csv", cache, state, log, report
+                )
+                if error is None:
+                    failed.pop(key, None)
+                else:
+                    refused_now[key] = error
+        except _StopRun as err:
+            stop = err
+        for key, error in refused_now.items():
+            attempts = failed.get(key, {}).get("attempts", 0) + 1
+            if attempts >= s.max_day_attempts:
+                failed.pop(key, None)
+                unavailable[key] = f"{error}, {attempts} lancements"
+                report.unavailable_days.append(f"{key} {side.upper()}")
+                log(
+                    f"  ✗ {key} {side.upper()} : refusé {attempts} fois ({error}) : déclaré "
+                    "indisponible chez la source, exclu par le contrôle qualité."
+                )
+            else:
+                failed[key] = {"attempts": attempts, "error": error}
+                report.retry_days.append(f"{key} {side.upper()}")
+                log(
+                    f"  ! {key} {side.upper()} : refusé ({error}) ; nouvel essai au prochain "
+                    f"lancement ({attempts}/{s.max_day_attempts})."
+                )
+        dest = self.raw_path(inst.symbol, side, chunk)
+        frames = [parse_candles_csv(f, start, end)[0] for f in sorted(day_dir.glob("*.csv"))]
+        frames = [f for f in frames if not f.empty]
+        month = pd.concat(frames, ignore_index=True) if frames else empty_candles()
+        write_candles_csv(month, dest)
+        missing = [
+            d
+            for d in days
+            if not (day_dir / f"{d:%Y-%m-%d}.csv").exists() and f"{d:%Y-%m-%d}" not in unavailable
+        ]
+        result = {
+            "rows": len(month),
+            "mode": "day",
+            "complete": not missing,
+            "failed_days": failed,
+            "unavailable_days": unavailable,
+        }
+        if not missing:
+            shutil.rmtree(day_dir, ignore_errors=True)
+            shutil.rmtree(cache, ignore_errors=True)
+        if stop is not None:
+            stop.partial = result
+            raise stop
+        return result
+
+    def _fetch_day(
+        self, inst, side, day, dest: Path, cache: Path, state: _RunState, log, report
+    ) -> str | None:
+        """Fetch one day. Returns None if served, or why it was refused (to retry later).
+
+        Raises ``_StopRun`` when the server keeps limiting the rate, or after too many
+        failed requests in a row.
+        """
         s = self.settings
         waits = 0
         while True:
             try:
-                self.source.fetch(inst.dukascopy.instrument_id, side, start, end, dest)
-                return
+                self.source.fetch(
+                    inst.dukascopy.instrument_id,
+                    side,
+                    day,
+                    day + pd.Timedelta(days=1),
+                    dest,
+                    cache_dir=cache,
+                )
             except RateLimitError:
                 report.rate_limited = True
+                if not self._server_is_limiting(inst, state):
+                    return "HTTP 429 sur ce jour seulement"
                 if waits >= s.rate_limit_max_waits:
-                    raise
+                    raise _StopRun(
+                        f"Dukascopy limite toujours le débit (HTTP 429) après {waits} pauses"
+                    ) from None
                 delay = min(s.rate_limit_wait_s * 2**waits, s.rate_limit_max_wait_s)
                 slow_down = getattr(self.source, "slow_down", None)
                 slower = f" Débit réduit : {slow_down()}." if slow_down else ""
                 log(
-                    f"  … {chunk.key} {side.upper()} : Dukascopy limite le débit (HTTP 429). "
+                    f"  … {day:%Y-%m-%d} {side.upper()} : Dukascopy limite le débit (HTTP 429). "
                     f"Pause de {delay} s puis nouvel essai ({waits + 1}/{s.rate_limit_max_waits})."
                     f"{slower}"
                 )
                 self.sleep(delay)
                 waits += 1
+                continue
+            except DownloadError as err:
+                state.error_streak += 1
+                if state.error_streak >= s.max_consecutive_failures:
+                    raise _StopRun(
+                        f"{state.error_streak} requêtes de suite en échec (dernière erreur : "
+                        f"{str(err).splitlines()[-1]})"
+                    ) from None
+                return str(err).splitlines()[-1][:200]
+            state.error_streak = 0
+            if day.dayofweek == 2:
+                state.probe = (day, side)
+            return None
+
+    def _server_is_limiting(self, inst: Instrument, state: _RunState) -> bool:
+        """Control request on a day known to be served: refused too = rate limit."""
+        day, side = state.probe
+        probe = self.raw_root / inst.symbol / ".probe.csv"
+        try:
+            self.source.fetch(
+                inst.dukascopy.instrument_id, side, day, day + pd.Timedelta(days=1), probe
+            )
+        except DownloadError:
+            return True
+        finally:
+            probe.unlink(missing_ok=True)
+        return False
 
     def build(
         self,
@@ -679,6 +902,26 @@ class Downloader:
             for key in year_keys:
                 chunk, entry = Chunk.from_key(key), manifest.chunks[key]
                 c_start, c_end = pd.Timestamp(entry["start"]), pd.Timestamp(entry["end"])
+                for side in SIDES:
+                    info = entry.get(side, {})
+                    for day, rec in info.get("failed_days", {}).items():
+                        issues.append(
+                            _issues(
+                                [pd.Timestamp(day, tz="UTC")],
+                                side,
+                                "source_missing",
+                                f"refusé : {rec['error']}",
+                            )
+                        )
+                    for day, why in info.get("unavailable_days", {}).items():
+                        issues.append(
+                            _issues(
+                                [pd.Timestamp(day, tz="UTC")],
+                                side,
+                                "source_unavailable",
+                                f"abandonné : {why}",
+                            )
+                        )
                 for side, bucket in (("bid", bids), ("ask", asks)):
                     frame, outside = parse_candles_csv(
                         self.raw_path(inst.symbol, side, chunk), c_start, c_end
@@ -693,9 +936,12 @@ class Downloader:
                                 f"{outside} lignes hors de la plage demandée ignorées",
                             )
                         )
-            bid = pd.concat(bids, ignore_index=True) if bids else parse_candles_csv(Path())[0]
-            ask = pd.concat(asks, ignore_index=True) if asks else parse_candles_csv(Path())[0]
+            bid = pd.concat(bids, ignore_index=True) if bids else empty_candles()
+            ask = pd.concat(asks, ignore_index=True) if asks else empty_candles()
             prices, merge_issues = merge_sides(bid, ask)
+            if prices.empty and not self.store.year_path(inst.symbol, year).exists():
+                log(f"  → {inst.symbol} {year} : aucune bougie pour l'instant, rien à construire")
+                continue
             all_issues = (
                 pd.concat([*issues, merge_issues], ignore_index=True) if issues else merge_issues
             )

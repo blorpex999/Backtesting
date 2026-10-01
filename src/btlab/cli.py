@@ -106,6 +106,21 @@ def download(
             continue
         for w in report.warnings:
             typer.secho(f"Avertissement : {w}", fg="yellow")
+        if report.retry_days:
+            typer.secho(
+                f"{symbol} : {len(report.retry_days)} jour(s) refusé(s) par la source, réessayés "
+                f"au prochain lancement : {', '.join(report.retry_days[:10])}"
+                + (" …" if len(report.retry_days) > 10 else ""),
+                fg="yellow",
+            )
+        if report.unavailable_days:
+            typer.secho(
+                f"{symbol} : {len(report.unavailable_days)} jour(s) déclaré(s) indisponible(s) "
+                f"chez la source (exclus par le contrôle qualité) : "
+                f"{', '.join(report.unavailable_days[:10])}"
+                + (" …" if len(report.unavailable_days) > 10 else ""),
+                fg="yellow",
+            )
         if not report.ok:
             failed = True
             typer.secho(

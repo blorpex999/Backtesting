@@ -54,7 +54,13 @@ def write_dukascopy_csv(frame: pd.DataFrame, side: str, path: Path) -> None:
 
 
 class FakeSource:
-    """In-memory Dukascopy: serves synthetic candles, can fail on demand, records calls."""
+    """In-memory Dukascopy: serves synthetic candles, can refuse on demand, records calls.
+
+    - ``refused_days``: days refused with HTTP 429 whatever the rate (any request covering
+      them fails), like the days Dukascopy kept refusing in practice;
+    - ``ip_block``: the next N requests get HTTP 429 (rate limit);
+    - ``fail_on``: (YYYY-MM, side) for which every request fails with another error.
+    """
 
     name = "fake-dukascopy"
     version = "0.0"
@@ -62,21 +68,26 @@ class FakeSource:
     def __init__(self, frames: dict[str, pd.DataFrame]):
         self.frames = frames  # instrument_id -> full BID/ASK frame
         self.calls: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
-        self.fail_on: set[tuple[str, str]] = set()  # (YYYY-MM, side)
-        self.rate_limit: dict[tuple[str, str], int] = {}  # (YYYY-MM, side) -> 429 count
+        self.cache_dirs: list[Path | None] = []
+        self.fail_on: set[tuple[str, str]] = set()
+        self.refused_days: set[str] = set()
+        self.ip_block = 0
         self.slow_downs = 0
 
     def slow_down(self) -> str:
         self.slow_downs += 1
         return "ralenti"
 
-    def fetch(self, instrument_id, side, start, end, dest: Path) -> None:
+    def fetch(self, instrument_id, side, start, end, dest: Path, cache_dir=None) -> None:
         self.calls.append((instrument_id, side, start, end))
-        key = (f"{start:%Y-%m}", side)
-        if self.rate_limit.get(key, 0) > 0:
-            self.rate_limit[key] -= 1
-            raise RateLimitError(f"Dukascopy limite le débit (HTTP 429) : {key}")
-        if key in self.fail_on:
+        self.cache_dirs.append(cache_dir)
+        if self.ip_block > 0:
+            self.ip_block -= 1
+            raise RateLimitError("Dukascopy limite le débit (HTTP 429) : limite simulée")
+        days = pd.date_range(start, end, freq="D", inclusive="left").strftime("%Y-%m-%d")
+        if any(d in self.refused_days for d in days):
+            raise RateLimitError("Dukascopy limite le débit (HTTP 429) : jour refusé simulé")
+        if (f"{start:%Y-%m}", side) in self.fail_on:
             raise DownloadError(f"échec simulé {start:%Y-%m} {side}")
         frame = self.frames[instrument_id]
         part = frame[(frame["ts_utc"] >= start) & (frame["ts_utc"] < end)]

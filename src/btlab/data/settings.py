@@ -34,7 +34,11 @@ class DownloadSettings(_Strict):
     rate_limit_wait_s: int = Field(default=60, gt=0)
     rate_limit_max_wait_s: int = Field(default=900, gt=0)
     rate_limit_max_waits: int = Field(default=6, ge=0)
-    max_consecutive_failures: int = Field(default=3, ge=1)
+    # A day refused alone (the control request passes) is retried at the next runs and
+    # declared unavailable after ``max_day_attempts`` runs.
+    max_day_attempts: int = Field(default=3, ge=1)
+    # Stop the run after N failed requests in a row (other than HTTP 429).
+    max_consecutive_failures: int = Field(default=10, ge=1)
 
 
 class QualitySettings(_Strict):
