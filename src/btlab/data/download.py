@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -43,6 +44,10 @@ Log = Callable[[str], None]
 
 class DownloadError(RuntimeError):
     """Download failure; the message is meant for the user."""
+
+
+class RateLimitError(DownloadError):
+    """Dukascopy refused the requests because of their rate (HTTP 429)."""
 
 
 def utc_now() -> pd.Timestamp:
@@ -197,6 +202,18 @@ class DukascopyNodeSource:
     def __init__(self, tools_dir: Path, settings: DownloadSettings):
         self.tools_dir = tools_dir
         self.settings = settings
+        # Current throttle; reduced by ``slow_down`` after a rate-limit refusal.
+        self.batch_size = settings.batch_size
+        self.batch_pause_ms = settings.batch_pause_ms
+
+    def slow_down(self) -> str:
+        """Halve the parallel requests and double the pause (for the rest of the run)."""
+        self.batch_size = max(1, self.batch_size // 2)
+        self.batch_pause_ms = min(max(self.batch_pause_ms * 2, 1000), 10_000)
+        return (
+            f"{self.batch_size} requête(s) à la fois, pause de "
+            f"{self.batch_pause_ms / 1000:g} s entre les lots"
+        )
 
     @property
     def version(self) -> str:
@@ -278,6 +295,7 @@ class DukascopyNodeSource:
         end: pd.Timestamp,
         out_dir: Path,
         stem: str,
+        cache_dir: Path,
     ) -> list[str]:
         s = self.settings
         return [
@@ -303,13 +321,18 @@ class DukascopyNodeSource:
             "-fn",
             stem,
             "-bs",
-            str(s.batch_size),
+            str(self.batch_size),
             "-bp",
-            str(s.batch_pause_ms),
+            str(self.batch_pause_ms),
             "-r",
             str(s.retries),
             "-rp",
             str(s.retry_pause_ms),
+            # Per-month cache: after a failure, the days already fetched are not requested
+            # again. Deleted once the month succeeds.
+            "-ch",
+            "-chpath",
+            str(cache_dir),
             "-s",
         ]
 
@@ -324,7 +347,8 @@ class DukascopyNodeSource:
         stem = f"{dest.stem}-{os.getpid()}"
         tmp_file = tmp_dir / f"{stem}.csv"
         tmp_file.unlink(missing_ok=True)
-        cmd = self.command(instrument_id, side, start, end, tmp_dir, stem)
+        cache_dir = dest.parent / ".cache" / dest.stem
+        cmd = self.command(instrument_id, side, start, end, tmp_dir, stem, cache_dir)
         try:
             proc = subprocess.run(
                 cmd,
@@ -343,12 +367,15 @@ class DukascopyNodeSource:
         if proc.returncode != 0 or not tmp_file.exists():
             tmp_file.unlink(missing_ok=True)  # dukascopy-node leaves an empty file behind
             tail = (proc.stderr.strip() or proc.stdout.strip())[-1500:]
+            what = f"{instrument_id} {side} {start:%Y-%m-%d} → {end:%Y-%m-%d}"
+            if "status 429" in tail:
+                raise RateLimitError(f"Dukascopy limite le débit (HTTP 429) : {what}")
             raise DownloadError(
-                f"dukascopy-node a échoué (code {proc.returncode}) pour {instrument_id} {side} "
-                f"{start:%Y-%m-%d} → {end:%Y-%m-%d} :\n{tail}"
+                f"dukascopy-node a échoué (code {proc.returncode}) pour {what} :\n{tail}"
             )
         dest.parent.mkdir(parents=True, exist_ok=True)
         os.replace(tmp_file, dest)
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     def catalog(self) -> dict[str, dict]:
         """Instrument catalogue of dukascopy-node (ids, names, first available dates)."""
@@ -413,10 +440,12 @@ class DownloadReport:
     failed: list[tuple[str, str, str]] = field(default_factory=list)
     years_built: list[int] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    aborted: str | None = None  # why the run stopped before the end, if it did
+    rate_limited: bool = False
 
     @property
     def ok(self) -> bool:
-        return not self.failed
+        return not self.failed and self.aborted is None
 
 
 class Downloader:
@@ -427,12 +456,14 @@ class Downloader:
         store: PriceStore,
         settings: DownloadSettings,
         now: Callable[[], pd.Timestamp] = utc_now,
+        sleep: Callable[[float], None] | None = None,
     ):
         self.source = source
         self.raw_root = raw_dir
         self.store = store
         self.settings = settings
         self.now = now
+        self.sleep = sleep or time.sleep
 
     def manifest_path(self, symbol: str) -> Path:
         return self.raw_root / symbol / "manifest.json"
@@ -496,8 +527,13 @@ class Downloader:
         manifest = self.load_manifest(inst)
         manifest.source, manifest.source_version = self.source.name, self.source.version
         span = f"{chunks[0].key} → {chunks[-1].key}"
-        log(f"{inst.symbol} : {len(chunks)} mois à télécharger ({span}).")
+        days = sum((min(c.end, hi) - max(c.start, lo)).days for c in chunks)
+        log(
+            f"{inst.symbol} : {len(chunks)} mois à télécharger ({span}), environ "
+            f"{2 * days} requêtes (une par jour et par côté)."
+        )
         touched_years: set[int] = set()
+        consecutive_failures = 0
         for chunk in chunks:
             c_start, c_end = max(chunk.start, lo), min(chunk.end, hi)
             entry = {"start": c_start.isoformat(), "end": c_end.isoformat()}
@@ -505,7 +541,16 @@ class Downloader:
             for side in SIDES:
                 dest = self.raw_path(inst.symbol, side, chunk)
                 try:
-                    self.source.fetch(inst.dukascopy.instrument_id, side, c_start, c_end, dest)
+                    self._fetch_with_backoff(inst, side, chunk, c_start, c_end, dest, log, report)
+                except RateLimitError as err:
+                    ok = False
+                    report.failed.append((chunk.key, side, str(err)))
+                    report.aborted = (
+                        f"Dukascopy limite toujours le débit (HTTP 429) après "
+                        f"{self.settings.rate_limit_max_waits} pauses"
+                    )
+                    log(f"  ✗ {chunk.key} {side.upper()} : {err}")
+                    break
                 except DownloadError as err:
                     ok = False
                     report.failed.append((chunk.key, side, str(err)))
@@ -514,7 +559,20 @@ class Downloader:
                 frame, _ = parse_candles_csv(dest, c_start, c_end)
                 entry[side] = {"rows": len(frame)}
             if not ok:
+                consecutive_failures += 1
+                if (
+                    report.aborted is None
+                    and consecutive_failures >= self.settings.max_consecutive_failures
+                ):
+                    report.aborted = f"{consecutive_failures} mois de suite en échec"
+                if report.aborted:
+                    log(
+                        f"  ■ Téléchargement de {inst.symbol} interrompu : {report.aborted}. "
+                        "Relancez plus tard : la reprise est automatique."
+                    )
+                    break
                 continue
+            consecutive_failures = 0
             if min(entry["bid"]["rows"], entry["ask"]["rows"]) == 0 and len(
                 expected_minutes(inst.sessions, c_start, c_end)
             ):
@@ -541,6 +599,39 @@ class Downloader:
         if touched_years:
             report.years_built = self.build(inst, sorted(touched_years), log=log, report=report)
         return report
+
+    def _fetch_with_backoff(
+        self,
+        inst: Instrument,
+        side: str,
+        chunk: Chunk,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        dest: Path,
+        log: Log,
+        report: DownloadReport,
+    ) -> None:
+        """Fetch one month and side; on HTTP 429, wait (doubling), slow down and retry."""
+        s = self.settings
+        waits = 0
+        while True:
+            try:
+                self.source.fetch(inst.dukascopy.instrument_id, side, start, end, dest)
+                return
+            except RateLimitError:
+                report.rate_limited = True
+                if waits >= s.rate_limit_max_waits:
+                    raise
+                delay = min(s.rate_limit_wait_s * 2**waits, s.rate_limit_max_wait_s)
+                slow_down = getattr(self.source, "slow_down", None)
+                slower = f" Débit réduit : {slow_down()}." if slow_down else ""
+                log(
+                    f"  … {chunk.key} {side.upper()} : Dukascopy limite le débit (HTTP 429). "
+                    f"Pause de {delay} s puis nouvel essai ({waits + 1}/{s.rate_limit_max_waits})."
+                    f"{slower}"
+                )
+                self.sleep(delay)
+                waits += 1
 
     def build(
         self,

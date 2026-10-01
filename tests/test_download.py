@@ -15,6 +15,7 @@ from btlab.data.download import (
     Downloader,
     DownloadError,
     DukascopyNodeSource,
+    RateLimitError,
     merge_sides,
     month_chunks,
     parse_candles_csv,
@@ -28,11 +29,14 @@ def _utc(s: str) -> pd.Timestamp:
     return pd.Timestamp(s, tz="UTC")
 
 
-def _downloader(ctx, source, now="2020-02-10 15:30") -> Downloader:
+def _downloader(ctx, source, now="2020-02-10 15:30", sleeps=None, **settings) -> Downloader:
     settings = ctx.settings.download.model_copy(
-        update={"history_start": pd.Timestamp("2019-11-01").date()}
+        update={"history_start": pd.Timestamp("2019-11-01").date(), **settings}
     )
-    return Downloader(source, ctx.paths.raw, ctx.store, settings, now=lambda: _utc(now))
+    record = sleeps.append if sleeps is not None else (lambda _: None)
+    return Downloader(
+        source, ctx.paths.raw, ctx.store, settings, now=lambda: _utc(now), sleep=record
+    )
 
 
 def test_month_chunks():
@@ -181,6 +185,60 @@ def test_failed_chunk_is_retried_on_next_run(ctx, eurusd_frame):
     assert report.ok and "2019-12" in report.planned and "2019-11" not in report.planned
 
 
+def test_rate_limit_waits_slows_down_and_retries_same_month(ctx, eurusd_frame):
+    source = FakeSource({"eurusd": eurusd_frame})
+    source.rate_limit = {("2019-12", "bid"): 2}
+    sleeps: list[float] = []
+    dl = _downloader(ctx, source, now="2020-01-15", sleeps=sleeps)
+    report = dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
+    assert report.ok and report.rate_limited
+    assert sleeps == [60, 120]  # doubling waits
+    assert source.slow_downs == 2
+    assert report.done == ["2019-11", "2019-12", "2020-01"]
+
+
+def test_persistent_rate_limit_stops_the_run_then_resumes(ctx, eurusd_frame):
+    source = FakeSource({"eurusd": eurusd_frame})
+    source.rate_limit = {("2019-12", "bid"): 99}
+    sleeps: list[float] = []
+    dl = _downloader(ctx, source, now="2020-02-15", sleeps=sleeps, rate_limit_max_waits=2)
+    logs: list[str] = []
+    report = dl.download(ctx.instrument("EURUSD"), log=logs.append)
+    assert sleeps == [60, 120]
+    assert report.aborted and "HTTP 429" in report.aborted and not report.ok
+    assert report.done == ["2019-11"]
+    assert not any(c[2] >= _utc("2020-01-01") for c in source.calls), "stopped, no hammering"
+    assert any("la reprise est automatique" in line for line in logs)
+    source.rate_limit = {}
+    report = dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
+    assert report.ok and report.planned == ["2019-12", "2020-01", "2020-02"]
+
+
+def test_wait_is_capped(ctx, eurusd_frame):
+    source = FakeSource({"eurusd": eurusd_frame})
+    source.rate_limit = {("2019-11", "bid"): 3}
+    sleeps: list[float] = []
+    dl = _downloader(
+        ctx,
+        source,
+        now="2019-12-05",
+        sleeps=sleeps,
+        rate_limit_wait_s=400,
+        rate_limit_max_wait_s=900,
+    )
+    dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
+    assert sleeps == [400, 800, 900]
+
+
+def test_consecutive_failures_stop_the_run(ctx, eurusd_frame):
+    source = FakeSource({"eurusd": eurusd_frame})
+    source.fail_on = {("2019-11", "bid"), ("2019-12", "bid"), ("2020-01", "bid")}
+    dl = _downloader(ctx, source, now="2020-02-15", max_consecutive_failures=3)
+    report = dl.download(ctx.instrument("EURUSD"), log=lambda _: None)
+    assert report.aborted == "3 mois de suite en échec"
+    assert not any(c[2] >= _utc("2020-02-01") for c in source.calls)
+
+
 def test_empty_month_while_quotes_expected_is_flagged(ctx, eurusd_frame):
     inst = ctx.instrument("EURUSD")
     frame = eurusd_frame[
@@ -210,9 +268,13 @@ const fs = require('fs'); const path = require('path');
 const a = process.argv.slice(2); const get = (k) => a[a.indexOf(k) + 1];
 const out = path.join(get('-dir'), get('-fn') + '.csv');
 fs.mkdirSync(get('-dir'), {recursive: true});
+if (a.includes('-ch')) {  // the real CLI caches each fetched day in -chpath
+  fs.mkdirSync(get('-chpath'), {recursive: true});
+  fs.writeFileSync(path.join(get('-chpath'), 'day.json'), '{}');
+}
 if (process.env.FAKE_FAIL) {
   fs.writeFileSync(out, '');  // the real CLI leaves an empty file behind
-  console.error('Request failed with status 403'); process.exit(1);
+  console.error('Request failed with status ' + process.env.FAKE_FAIL); process.exit(1);
 }
 fs.writeFileSync(out, 'timestamp,open,high,low,close,volume\n1577916000000,1.1,1.2,1.0,1.15,2\n');
 fs.writeFileSync(out + '.args.json', JSON.stringify(a));
@@ -245,12 +307,29 @@ def test_node_source_command_and_output(fake_node_source, tmp_path):
 
 
 def test_node_source_failure_raises(fake_node_source, tmp_path, monkeypatch):
-    monkeypatch.setenv("FAKE_FAIL", "1")
+    monkeypatch.setenv("FAKE_FAIL", "403")
     dest = tmp_path / "raw" / "x.csv"
     with pytest.raises(DownloadError, match="status 403"):
         fake_node_source.fetch("eurusd", "ask", _utc("2020-01-01"), _utc("2020-02-01"), dest)
     assert not dest.exists()
     assert not list((dest.parent / ".tmp").glob("*.csv")), "no leftover temporary file"
+
+
+def test_node_source_rate_limit_slow_down_and_cache(fake_node_source, tmp_path, monkeypatch):
+    dest = tmp_path / "raw" / "EURUSD" / "bid" / "2020-01.csv"
+    cache = dest.parent / ".cache" / "2020-01"
+    monkeypatch.setenv("FAKE_FAIL", "429")
+    with pytest.raises(RateLimitError, match="HTTP 429"):
+        fake_node_source.fetch("eurusd", "bid", _utc("2020-01-01"), _utc("2020-02-01"), dest)
+    assert cache.is_dir(), "cache kept after a failure: fetched days are not requested again"
+
+    assert fake_node_source.slow_down().startswith("1 requête(s) à la fois")
+    monkeypatch.delenv("FAKE_FAIL")
+    fake_node_source.fetch("eurusd", "bid", _utc("2020-01-01"), _utc("2020-02-01"), dest)
+    args = json.loads(next((dest.parent / ".tmp").glob("*.args.json")).read_text())
+    assert args[args.index("-bs") + 1] == "1" and args[args.index("-bp") + 1] == "3000"
+    assert args[args.index("-chpath") + 1] == str(cache)
+    assert not cache.exists(), "cache removed once the month succeeded"
 
 
 def test_missing_node_gives_install_hint(tmp_path, monkeypatch):

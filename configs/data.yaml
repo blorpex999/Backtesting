@@ -2,11 +2,18 @@ download:
   tool: dukascopy-node
   version: "1.50.0"          # version épinglée (npm)
   history_start: 2009-01-01  # début de la chauffe ; l'IS commence en 2010
-  batch_size: 10             # requêtes parallèles par lot
-  batch_pause_ms: 1000       # pause entre lots (politesse envers le serveur)
-  retries: 5                # au moins 1 : avec 0, dukascopy-node masque les erreurs réseau
-  retry_pause_ms: 2000
-  timeout_s: 1800            # par mois et par côté (BID / ASK)
+  # Dukascopy limite le débit de son API (HTTP 429) : réglages volontairement prudents.
+  batch_size: 2              # requêtes parallèles par lot
+  batch_pause_ms: 1500       # pause entre lots
+  retries: 3                 # au moins 1 : avec 0, dukascopy-node masque les erreurs réseau
+  retry_pause_ms: 15000      # pause entre deux reprises d'une même requête
+  timeout_s: 3600            # par mois et par côté (BID / ASK)
+  # En cas de HTTP 429 : pause (60 s, puis doublée à chaque fois, 900 s au plus),
+  # débit réduit, et nouvel essai du même mois ; arrêt propre après 6 pauses.
+  rate_limit_wait_s: 60
+  rate_limit_max_wait_s: 900
+  rate_limit_max_waits: 6
+  max_consecutive_failures: 3  # arrêt après N mois de suite en échec (autre cause)
 
 quality:
   # Fuseau des « jours » du contrôle qualité (et des jours exclus).

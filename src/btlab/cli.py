@@ -114,6 +114,16 @@ def download(
                 fg="red",
                 err=True,
             )
+        if report.aborted and report.rate_limited:
+            rest = chosen[chosen.index(symbol) + 1 :]
+            if rest:
+                typer.secho(
+                    f"Dukascopy limite le débit : instruments non traités cette fois-ci : "
+                    f"{', '.join(rest)}.",
+                    fg="red",
+                    err=True,
+                )
+            break
     raise typer.Exit(1 if failed else 0)
 
 

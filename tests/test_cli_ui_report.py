@@ -138,3 +138,19 @@ def test_cli_update_and_build(project, fake_source):
     assert "GBPUSD" in result.output
     result = runner.invoke(app, ["data", "build", "GBPUSD"])
     assert result.exit_code == 0 and "2019.parquet" in result.output
+
+
+def test_cli_rate_limit_stops_remaining_symbols(project, fake_source, ctx, monkeypatch):
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    fake_source.frames["eurusd"] = synthetic_m1(
+        ctx.instrument("EURUSD"), "2019-12-01", "2020-01-10"
+    )
+    fake_source.rate_limit = {("2019-12", "bid"): 99}
+    args = ["data", "download", "GBPUSD", "EURUSD", "--from", "2019-12-01", "--to", "2020-01-10"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 1
+    out = result.output + (result.stderr or "")
+    assert "HTTP 429" in out and "non traités cette fois-ci : EURUSD" in out
+    assert not any(c[0] == "eurusd" for c in fake_source.calls)

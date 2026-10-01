@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from btlab.context import DataContext
-from btlab.data.download import DownloadError
+from btlab.data.download import DownloadError, RateLimitError
 from btlab.data.synthetic import synthetic_m1
 from btlab.paths import DATA_ENV, ROOT_ENV, Paths
 
@@ -63,10 +63,20 @@ class FakeSource:
         self.frames = frames  # instrument_id -> full BID/ASK frame
         self.calls: list[tuple[str, str, pd.Timestamp, pd.Timestamp]] = []
         self.fail_on: set[tuple[str, str]] = set()  # (YYYY-MM, side)
+        self.rate_limit: dict[tuple[str, str], int] = {}  # (YYYY-MM, side) -> 429 count
+        self.slow_downs = 0
+
+    def slow_down(self) -> str:
+        self.slow_downs += 1
+        return "ralenti"
 
     def fetch(self, instrument_id, side, start, end, dest: Path) -> None:
         self.calls.append((instrument_id, side, start, end))
-        if (f"{start:%Y-%m}", side) in self.fail_on:
+        key = (f"{start:%Y-%m}", side)
+        if self.rate_limit.get(key, 0) > 0:
+            self.rate_limit[key] -= 1
+            raise RateLimitError(f"Dukascopy limite le débit (HTTP 429) : {key}")
+        if key in self.fail_on:
             raise DownloadError(f"échec simulé {start:%Y-%m} {side}")
         frame = self.frames[instrument_id]
         part = frame[(frame["ts_utc"] >= start) & (frame["ts_utc"] < end)]

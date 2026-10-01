@@ -19,13 +19,20 @@ class DownloadSettings(_Strict):
     tool: str = "dukascopy-node"
     version: str = "1.50.0"
     history_start: date = date(2009, 1, 1)
-    batch_size: int = Field(default=10, gt=0)
-    batch_pause_ms: int = Field(default=1000, ge=0)
+    # Dukascopy rate-limits its API (HTTP 429): stay gentle by default.
+    batch_size: int = Field(default=2, gt=0)
+    batch_pause_ms: int = Field(default=1500, ge=0)
     # >= 1 on purpose: with 0 retries dukascopy-node swallows network errors, writes an
     # empty file and exits with code 0 (observed with 1.50.0) - a silent data loss.
-    retries: int = Field(default=5, ge=1)
-    retry_pause_ms: int = Field(default=2000, ge=0)
-    timeout_s: int = Field(default=1800, gt=0)
+    retries: int = Field(default=3, ge=1)
+    retry_pause_ms: int = Field(default=15000, ge=0)
+    timeout_s: int = Field(default=3600, gt=0)
+    # HTTP 429 handled on the Python side: wait (doubling each time), slow down, retry the
+    # same month; give up the run after ``rate_limit_max_waits`` waits.
+    rate_limit_wait_s: int = Field(default=60, gt=0)
+    rate_limit_max_wait_s: int = Field(default=900, gt=0)
+    rate_limit_max_waits: int = Field(default=6, ge=0)
+    max_consecutive_failures: int = Field(default=3, ge=1)
 
 
 class QualitySettings(_Strict):
