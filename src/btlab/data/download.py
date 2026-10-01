@@ -199,9 +199,15 @@ class DukascopyNodeSource:
 
     name = "dukascopy-node"
 
-    def __init__(self, tools_dir: Path, settings: DownloadSettings):
+    def __init__(
+        self,
+        tools_dir: Path,
+        settings: DownloadSettings,
+        sleep: Callable[[float], None] | None = None,
+    ):
         self.tools_dir = tools_dir
         self.settings = settings
+        self.sleep = sleep or time.sleep
         # Current throttle; reduced by ``slow_down`` after a rate-limit refusal.
         self.batch_size = settings.batch_size
         self.batch_pause_ms = settings.batch_pause_ms
@@ -376,6 +382,8 @@ class DukascopyNodeSource:
         dest.parent.mkdir(parents=True, exist_ok=True)
         os.replace(tmp_file, dest)
         shutil.rmtree(cache_dir, ignore_errors=True)
+        # Keep the same spacing between two runs of the CLI as between two batches.
+        self.sleep(self.batch_pause_ms / 1000)
 
     def catalog(self) -> dict[str, dict]:
         """Instrument catalogue of dukascopy-node (ids, names, first available dates)."""

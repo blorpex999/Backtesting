@@ -285,7 +285,7 @@ fs.writeFileSync(out + '.args.json', JSON.stringify(a));
 def fake_node_source(tmp_path: Path) -> DukascopyNodeSource:
     if shutil.which("node") is None:
         pytest.skip("Node.js absent")
-    source = DukascopyNodeSource(tmp_path / "tools", DownloadSettings())
+    source = DukascopyNodeSource(tmp_path / "tools", DownloadSettings(), sleep=lambda _: None)
     source.cli_js.parent.mkdir(parents=True)
     source.cli_js.write_text(FAKE_CLI, encoding="utf-8")
     return source
@@ -330,6 +330,16 @@ def test_node_source_rate_limit_slow_down_and_cache(fake_node_source, tmp_path, 
     assert args[args.index("-bs") + 1] == "1" and args[args.index("-bp") + 1] == "3000"
     assert args[args.index("-chpath") + 1] == str(cache)
     assert not cache.exists(), "cache removed once the month succeeded"
+
+
+def test_node_source_pauses_between_runs(fake_node_source, tmp_path):
+    pauses: list[float] = []
+    fake_node_source.sleep = pauses.append
+    for month in ("2020-01", "2020-02"):
+        start = _utc(f"{month}-01")
+        dest = tmp_path / "raw" / f"{month}.csv"
+        fake_node_source.fetch("eurusd", "bid", start, start + pd.offsets.MonthBegin(1), dest)
+    assert pauses == [1.5, 1.5]  # same spacing as between two batches
 
 
 def test_missing_node_gives_install_hint(tmp_path, monkeypatch):

@@ -49,8 +49,8 @@ coupure. Seuls les jours UTC complets sont téléchargés ; le mois en cours est
 mise à jour suivante.
 
 **Limite de débit Dukascopy (HTTP 429).** L'API de Dukascopy refuse les requêtes trop rapprochées.
-Les réglages par défaut sont donc prudents : 2 requêtes à la fois, 1,5 s de pause entre les lots
-(`configs/data.yaml`). En cas de refus, l'outil :
+Les réglages par défaut sont donc prudents : une requête à la fois, 1,5 s de pause entre deux
+requêtes, soit environ 0,6 requête/s (`configs/data.yaml`). En cas de refus, l'outil :
 
 - attend 60 s, puis 120 s, 240 s… (15 min au plus) ;
 - réduit le débit ;
@@ -60,7 +60,7 @@ Si le refus persiste après 6 pauses, il s'arrête proprement, et les instrument
 sont pas traités : relancez plus tard, la reprise est automatique. Les jours déjà récupérés d'un
 mois interrompu sont gardés en cache et ne sont pas redemandés. L'historique complet représente
 environ 13 000 requêtes par instrument (une par jour et par côté) : la première récupération
-prend plusieurs heures par instrument (à lancer la nuit, par exemple), les mises à jour suivantes
+prend environ 6 heures par instrument à ce débit (à lancer la nuit, par exemple), les mises à jour suivantes
 sont rapides.
 
 Dans le code, les prix se lisent **uniquement** via le chargeur :
