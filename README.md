@@ -56,8 +56,8 @@ raisons différentes que l'outil distingue :
 
 Fonctionnement :
 
-1. Chaque mois est d'abord demandé d'un bloc, une requête à la fois, avec 1,5 s de pause
-   (environ 0,6 requête/s, `configs/data.yaml`).
+1. Chaque mois est d'abord demandé d'un bloc, 4 requêtes à la fois avec 1 s de pause entre
+   les lots (`configs/data.yaml`).
 2. Si le mois échoue, il est repris **jour par jour**. Les jours déjà obtenus sont relus dans
    le cache, sans nouvelle requête.
 3. Chaque refus est vérifié par une **requête témoin** sur un jour déjà servi :
@@ -71,8 +71,8 @@ Fonctionnement :
 
 La fin de la commande résume les jours refusés (à réessayer) et les jours déclarés
 indisponibles. L'historique complet représente environ 13 000 requêtes par instrument (une par
-jour et par côté) : la première récupération prend environ 6 heures par instrument à ce débit (à
-lancer la nuit, par exemple), les mises à jour suivantes sont rapides.
+jour et par côté) : comptez de l'ordre d'une à deux heures par instrument sans limitation, plus
+si Dukascopy impose des pauses. Les mises à jour suivantes sont rapides.
 
 Dans le code, les prix se lisent **uniquement** via le chargeur :
 

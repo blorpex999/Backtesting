@@ -2,10 +2,10 @@ download:
   tool: dukascopy-node
   version: "1.50.0"          # version épinglée (npm)
   history_start: 2009-01-01  # début de la chauffe ; l'IS commence en 2010
-  # Dukascopy limite le débit de son API (HTTP 429, blocage observé après une soixantaine
-  # de requêtes en rafale) : une requête à la fois, environ 0,6 requête/s.
-  batch_size: 1              # requêtes parallèles par lot
-  batch_pause_ms: 1500       # pause entre deux requêtes (et entre deux mois)
+  # Sous les réglages d'origine de dukascopy-node (10 requêtes, 1 s). En cas de vraie
+  # limite de débit (détectée par une requête témoin), l'outil ralentit tout seul.
+  batch_size: 4              # requêtes parallèles par lot
+  batch_pause_ms: 1000       # pause entre deux lots (et entre deux mois)
   retries: 1                 # au moins 1 : avec 0, dukascopy-node masque les erreurs réseau ;
                              # pas plus : pendant un blocage, insister le prolonge
   retry_pause_ms: 10000      # pause avant la reprise d'une requête

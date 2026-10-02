@@ -369,13 +369,13 @@ def test_node_source_rate_limit_slow_down_and_cache(fake_node_source, tmp_path, 
         )
     assert cache.is_dir(), "cache kept after a failure: fetched days are not requested again"
 
-    assert fake_node_source.slow_down().startswith("1 requête(s) à la fois")
+    assert fake_node_source.slow_down().startswith("2 requête(s) à la fois")
     monkeypatch.delenv("FAKE_FAIL")
     fake_node_source.fetch(
         "eurusd", "bid", _utc("2020-01-01"), _utc("2020-02-01"), dest, cache_dir=cache
     )
     args = json.loads(next((dest.parent / ".tmp").glob("*.args.json")).read_text())
-    assert args[args.index("-bs") + 1] == "1" and args[args.index("-bp") + 1] == "3000"
+    assert args[args.index("-bs") + 1] == "2" and args[args.index("-bp") + 1] == "2000"
     assert args[args.index("-chpath") + 1] == str(cache)
     fake_node_source.fetch("eurusd", "bid", _utc("2020-01-01"), _utc("2020-01-02"), dest)
     args = json.loads(next((dest.parent / ".tmp").glob("*.args.json")).read_text())
@@ -389,7 +389,7 @@ def test_node_source_pauses_between_runs(fake_node_source, tmp_path):
         start = _utc(f"{month}-01")
         dest = tmp_path / "raw" / f"{month}.csv"
         fake_node_source.fetch("eurusd", "bid", start, start + pd.offsets.MonthBegin(1), dest)
-    assert pauses == [1.5, 1.5]  # same spacing as between two batches
+    assert pauses == [1.0, 1.0]  # same spacing as between two batches
 
 
 def test_missing_node_gives_install_hint(tmp_path, monkeypatch):

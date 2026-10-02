@@ -19,10 +19,11 @@ class DownloadSettings(_Strict):
     tool: str = "dukascopy-node"
     version: str = "1.50.0"
     history_start: date = date(2009, 1, 1)
-    # Dukascopy rate-limits its API (HTTP 429, roughly 60 requests before a block was
-    # observed): one request at a time, ~0.6 request/s by default.
-    batch_size: int = Field(default=1, gt=0)
-    batch_pause_ms: int = Field(default=1500, ge=0)
+    # Below dukascopy-node's own defaults (10 requests, 1 s). Most of the HTTP 429 seen
+    # in practice were specific days refused whatever the rate; a real rate limit is
+    # detected with a control request and the downloader then slows itself down.
+    batch_size: int = Field(default=4, gt=0)
+    batch_pause_ms: int = Field(default=1000, ge=0)
     # >= 1 on purpose: with 0 retries dukascopy-node swallows network errors, writes an
     # empty file and exits with code 0 (observed with 1.50.0) - a silent data loss.
     # Kept at 1: during a block, extra retries only prolong it; the Python side waits.
